@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+sqlalchemy
+bcrypt
+python-jose[cryptography]
+python-multipart
+langchain
+langchain-google-genai
+langchain-openai
+requests
+pandas
+python-dotenv
+pydantic
