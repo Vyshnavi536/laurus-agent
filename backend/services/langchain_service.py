@@ -1,4 +1,5 @@
 import os
+import re
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -6,6 +7,47 @@ from services.openfda_service import get_drug_info
 from services.interaction_service import check_interaction
 
 load_dotenv()
+
+# These words often appear in questions about medicines, but are not drug names.
+DRUG_EXTRACTION_STOP_WORDS = {
+    "what", "which", "is", "are", "the", "of", "and", "with", "for", "any",
+    "interaction", "interactions", "between", "show", "info", "information",
+    "tell", "me", "about", "how", "does", "do", "interact", "common", "side",
+    "effects", "effect", "adverse", "reaction", "reactions", "symptoms", "uses",
+    "use", "warnings", "warning", "dosage", "dose", "taking", "take", "can",
+    "i", "my", "please", "drug", "medicine", "medication", "medications",
+}
+
+
+def _clean_drug_candidates(candidates: list[str]) -> list[str]:
+    """Remove question wording and formatting from extracted drug candidates."""
+    import re
+
+    cleaned = []
+    seen = set()
+    for candidate in candidates:
+        name = re.sub(r"^[\s\-*•\"'`]+|[\s.?!:;\"'`]+$", "", candidate).strip()
+        if not name or name.upper() == "NONE":
+            continue
+        # Reject generic query words, including accidental multi-word chunks.
+        if all(word.lower() in DRUG_EXTRACTION_STOP_WORDS for word in re.findall(r"[A-Za-z]+", name)):
+            continue
+        key = name.casefold()
+        if key not in seen:
+            cleaned.append(name)
+            seen.add(key)
+    return cleaned
+
+
+def _query_drug_fallback(query: str) -> list[str]:
+    """Extract plausible single-token names if the LLM returns only query words."""
+    import re
+
+    words = re.findall(r"\b[A-Za-z][A-Za-z0-9-]*\b", query)
+    return _clean_drug_candidates([
+        word for word in words
+        if word.lower() not in DRUG_EXTRACTION_STOP_WORDS and len(word) > 2
+    ])[:2]
 
 def get_llm():
     api_key = os.getenv("GEMINI_API_KEY")
@@ -15,23 +57,24 @@ def get_llm():
 
 def extract_drugs(query: str) -> list:
     llm = get_llm()
-    prompt = f"Extract the names of pharmaceutical drugs or substances (like alcohol, tobacco) mentioned in this query. Return them as a comma-separated list. If none, return 'NONE'. Query: {query}"
+    prompt = f"""Extract only explicit names of medicines or substances (for example, metformin, warfarin, alcohol) from the user's query.
+Do not treat ordinary question words such as common, side, effects, symptoms, interaction, or medicine as drug names.
+Do not infer or invent names. Return only the exact name(s) mentioned, comma-separated. If no name is present, return NONE.
+User query: {query}"""
     try:
         response = llm.invoke([HumanMessage(content=prompt)])
         content = response.content.strip()
         print(f"LLM Content: {content}")
-        if content == "NONE" or not content:
-            return []
-        drugs = [d.strip() for d in content.split(',')]
+        drugs = _clean_drug_candidates(re.split(r"\s*(?:,|;|\+|&|\band\b|\n)\s*", content, flags=re.IGNORECASE))
+        # If Gemini missed the medicine and returned only words from the question,
+        # recover the likely names directly from the query.
+        if not drugs:
+            drugs = _query_drug_fallback(query)
         print(f"Extracted Drugs: {drugs}")
         return drugs
     except Exception as e:
         print(f"LLM Error: {e}")
-        import re
-        words = re.findall(r'\b\w+\b', query.lower())
-        stop_words = {'what', 'is', 'are', 'the', 'of', 'and', 'with', 'for', 'any', 'interaction', 'between', 'show', 'info', 'tell', 'me', 'about', 'how', 'does', 'interact'}
-        found = [w for w in words if w not in stop_words and len(w) > 2]
-        return found[:2]
+        return _query_drug_fallback(query)
 
 def format_single_drug_response(drug: str, info: dict) -> str:
     if not info:
@@ -66,7 +109,7 @@ def format_single_drug_response(drug: str, info: dict) -> str:
 
 def format_interaction_response(drug1: str, drug2: str, info: dict) -> str:
     if not info:
-        return f"**Interaction: {drug1.capitalize()} + {drug2.capitalize()}**\n\nNo known interactions were found in the clinical datasets or safety protocols. These substances are generally considered compatible. However, individual reactions vary, so always monitor for any unusual symptoms.\n\n**Source:** Medical Intelligence Database\n\n*Disclaimer: Informational use only. Consult a professional.*"
+        return f"**Interaction: {drug1.capitalize()} + {drug2.capitalize()}**\n\nNo matching interaction record was found in the configured dataset. This does not confirm that the combination is safe or compatible. Ask a pharmacist or other healthcare professional to check these substances.\n\n**Source:** Configured interaction dataset\n\n*Disclaimer: Informational use only. Consult a professional.*"
     
     llm = get_llm()
     prompt = f"""
